@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Provisions a secure AWS VPC with two private subnets across different
+  Availability Zones, an EC2 instance accessible only via AWS Systems Manager
+  Session Manager (no internet gateway, no NAT gateway, no bastion host).
+  Demonstrates zero-trust, least-privilege infrastructure design using
+  Infrastructure-as-Code best practices.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - AvailabilityZone1
+          - AvailabilityZone2
+      - Label:
+          default: EC2 Instance Configuration
+        Parameters:
+          - InstanceType
+          - AmiId
+          - ProjectName
+          - Environment
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+
+  ProjectName:
+    Type: String
+    Default: private-vpc-demo
+    Description: Name prefix applied to all resources for easy identification.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment (used in resource tagging).
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for the VPC.
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for Private Subnet 1 (AZ1).
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR block for Private Subnet 2 (AZ2).
+
+  AvailabilityZone1:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: First Availability Zone for Private Subnet 1.
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Second Availability Zone for Private Subnet 2 (must differ from AZ1).
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t2.micro
+    Description: EC2 instance type.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: >
+      SSM Parameter path for the latest Amazon Linux 2 AMI.
+      Uses AWS public SSM parameter so the AMI ID is always current.
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # VPC
+  # ---------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true       # Required for SSM VPC endpoints
+      EnableDnsHostnames: true     # Required for SSM VPC endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # PRIVATE SUBNETS
+  # No route to internet gateway or NAT gateway — fully private
+  # ---------------------------------------------------------------------------
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Ref AvailabilityZone1
+      MapPublicIpOnLaunch: false   # Never assign public IPs
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-subnet-1
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tier
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-subnet-2
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Tier
+          Value: Private
+
+  # ---------------------------------------------------------------------------
+  # ROUTE TABLE (private — no internet routes)
+  # ---------------------------------------------------------------------------
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-rt
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUP — EC2 INSTANCE
+  # No inbound rules (SSH port 22 is intentionally absent)
+  # SSM Session Manager uses outbound HTTPS only
+  # ---------------------------------------------------------------------------
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >
+        Security group for private EC2 instance.
+        No inbound rules — access exclusively via SSM Session Manager.
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for SSM endpoint communication
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ec2-sg
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUP — VPC ENDPOINTS
+  # Allows EC2 instances in the VPC to reach SSM service endpoints
+  # ---------------------------------------------------------------------------
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >
+        Security group for SSM VPC Interface Endpoints.
+        Allows HTTPS from within the VPC CIDR only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+          Description: HTTPS from VPC CIDR to SSM endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-endpoint-sg
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # IAM ROLE — EC2 SSM INSTANCE PROFILE
+  # Grants the EC2 instance permission to register with SSM
+  # Follows least-privilege principle
+  # ---------------------------------------------------------------------------
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ec2-ssm-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ec2-ssm-role
+        - Key: Environment
+          Value: !Ref Environment
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-ec2-instance-profile
+      Roles:
+        - !Ref EC2SSMRole
+
+  # ---------------------------------------------------------------------------
+  # VPC INTERFACE ENDPOINTS — AWS SYSTEMS MANAGER
+  # Enables SSM Session Manager without internet access.
+  # Three endpoints are required: ssm, ssmmessages, ec2messages
+  # ---------------------------------------------------------------------------
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ---------------------------------------------------------------------------
+  # EC2 INSTANCE
+  # Deployed in Private Subnet 1, no public IP, managed via SSM only
+  # ---------------------------------------------------------------------------
+  PrivateEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      SubnetId: !Ref PrivateSubnet1
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y amazon-ssm-agent
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-ec2
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Access
+          Value: SSM-Only
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${ProjectName}-VpcId
+
+  PrivateSubnet1Id:
+    Description: Private Subnet 1 ID (AZ1)
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub ${ProjectName}-PrivateSubnet1Id
+
+  PrivateSubnet2Id:
+    Description: Private Subnet 2 ID (AZ2)
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${ProjectName}-PrivateSubnet2Id
+
+  EC2InstanceId:
+    Description: EC2 Instance ID (connect via SSM Session Manager)
+    Value: !Ref PrivateEC2Instance
+    Export:
+      Name: !Sub ${ProjectName}-EC2InstanceId
+
+  SSMConnectCommand:
+    Description: AWS CLI command to connect to the EC2 instance via SSM
+    Value: !Sub >
+      aws ssm start-session --target ${PrivateEC2Instance} --region ${AWS::Region}
+
+  EC2SSMRoleArn:
+    Description: ARN of the IAM role attached to the EC2 instance
+    Value: !GetAtt EC2SSMRole.Arn
