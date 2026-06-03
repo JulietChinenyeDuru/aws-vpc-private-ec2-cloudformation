@@ -10,7 +10,7 @@
 
 ## Overview
 
-This project provisions a **fully private, internet-free AWS network environment** using a single CloudFormation template. An EC2 instance is deployed with **no public IP address, no SSH port open, and no internet gateway or NAT gateway** — yet remains fully manageable via **AWS Systems Manager Session Manager**.
+This project provisions a **fully private, internet-free AWS network environment** using a single CloudFormation template. An EC2 instance is deployed with **no public IP address, no SSH port open, and no internet gateway or NAT gateway** yet remains fully manageable via **AWS Systems Manager Session Manager**.
 
 This approach reflects modern **zero-trust security** principles: rather than exposing a bastion host or relying on key-pair SSH access, all instance management is routed through private VPC interface endpoints, reducing the attack surface to near-zero.
 
